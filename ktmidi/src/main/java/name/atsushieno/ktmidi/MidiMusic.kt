@@ -14,20 +14,33 @@ internal fun OutputStream.writeByte(b : Byte)
     this.write(arr, 0, 1)
 }
 
-class MidiMusic {
+class Midi2Music {
     companion object {
-        fun read (stream : InputStream) : MidiMusic {
+        fun read (stream : InputStream) : Midi2Music {
             val r = SmfReader (stream)
             r.read ()
             return r.music
         }
 
-        fun getMetaEventsOfType (messages : Iterable<MidiMessage>, metaType : Byte) = sequence {
-            var v = 0
+        // We treat SYSEX8 of Univ. SysEx (Manufacturer 0x7E) with NACK (SubID 0x7E) as META events.
+        // The resulting UMPs contain only JR timestamp and SYSEX8 of such ones.
+        fun getMetaEventsOfType (messages : Iterable<Midi2Event>, metaType : Byte) = sequence {
+            var inMeta = false
             for (m in messages) {
-                v += m.deltaTime
-                if (m.event.eventType == MidiEventType.META && m.event.msb == metaType)
-                    yield(MidiMessage(v, m.event))
+                if (m.messageType == MidiMessageType.UTILITY && m.eventType == MidiEventType.JR_TIMESTAMP)
+                    yield(m)
+                // If it is beginning of META messages, switch to inMeta mode, and send JR timestamp for this event (delta since last meta).
+                if (m.messageType == MidiMessageType.SYSEX8_MDS && (m.eventType == 0x0.toByte() || m.eventType == 0x1.toByte()) &&
+                    (m.second64Bits and 0xFF000000u) == 0x7E000000UL &&
+                    (m.second64Bits and 0xFF0000u) == 0x7E0000UL) {
+                    inMeta = true
+                }
+                if (inMeta) {
+                    if (m.messageType == MidiMessageType.SYSEX8_MDS && (m.eventType != 0x0.toByte() || m.eventType == 0x3.toByte()))
+                        inMeta = false
+                    else
+                        yield(m)
+                }
             }
         }
 
@@ -101,26 +114,21 @@ class MidiMusic {
 class MidiTrack
 {
     constructor ()
-            : this (ArrayList<MidiMessage> ())
+            : this (ArrayList<Midi2Event> ())
 
-    constructor(messages : MutableList<MidiMessage>?)
+    constructor(messages : MutableList<Midi2Event>?)
     {
         if (messages == null)
             throw IllegalArgumentException ("null messages")
         this.messages = messages
     }
 
-    var messages : MutableList<MidiMessage> = ArrayList ()
+    var messages : MutableList<Midi2Event> = ArrayList ()
 
-    fun addMessage (msg : MidiMessage)
+    fun addMessage (msg : Midi2Event)
     {
         messages.add (msg)
     }
-}
-
-class MidiMessage(val deltaTime: Int, evt: MidiEvent) {
-
-    val event : MidiEvent = evt
 }
 
 class MidiCC
@@ -336,6 +344,7 @@ class MidiEventType {
     companion object {
 
         // MIDI 2.0-specific
+        const val JR_TIMESTAMP: Byte = 0x02.toByte()
         const val PER_NOTE_RCC: Byte = 0x00.toByte()
         const val PER_NOTE_ACC: Byte = 0x10.toByte()
         const val RPN: Byte = 0x20.toByte()
@@ -372,7 +381,7 @@ class MidiEventType {
     }
 }
 
-class MidiEvent // MIDI 1.0 only
+class Midi2Event // MIDI 2.0 only
 {
     companion object {
 
@@ -380,58 +389,53 @@ class MidiEvent // MIDI 1.0 only
             var i = index
             val end = index +size
             while (i < end) {
-                if (bytes[i].toUnsigned() == 0xF0) {
-                    yield (MidiEvent (0xF0, 0, 0, bytes, i, size))
-                    i += size
-                } else {
-                    if (end < i + MidiEvent.fixedDataSize(bytes[i]))
-                        throw Exception (String.format("Received data was incomplete to build MIDI status message for '%x' status.", bytes[i]))
-                    val z = MidiEvent.fixedDataSize(bytes[i])
-                    yield (MidiEvent (bytes[i].toUnsigned(), (if (z > 0) bytes [i + 1].toUnsigned() else 0), (if (z > 1) bytes [i + 2].toUnsigned() else 0), null, 0, 0))
-                    i += z + 1
+                var size = getUmpSizeInBytes(bytes[i])
+                when (size) {
+                    16 -> yield(Midi2Event(read64(bytes, i), read64(bytes, i + 8)))
+                    8 -> yield(Midi2Event(read64(bytes, i)))
+                    else -> yield(Midi2Event(read32(bytes, i).toULong()))
                 }
+                i += size
             }
         }
 
-        fun fixedDataSize (statusByte : Byte) : Byte =
-                when ((statusByte.toUnsigned() and 0xF0)) {
-                    0xF0 -> {
-                        when (statusByte.toUnsigned()) {
-                            0xF1, 0xF3 -> 1
-                            0xF2 -> 2
-                            else -> 0
-                        }
-                    } // including 0xF7, 0xFF
-                    0xC0, 0xD0 -> 1
-                    else -> 2
-                }
+        fun getUmpSizeInBytes (head: Byte) : Int {
+            return when ((head.toInt() shr 4).toByte()) {
+                MidiMessageType.SYSEX7, MidiMessageType.MIDI2 -> 8
+                MidiMessageType.SYSEX8_MDS -> 16
+                else -> 4
+            }
+        }
+
+        fun read32(array: ByteArray, index: Int) : UInt =
+                (array[index].toUInt() shl 24) + (array[index + 1].toUInt() shl 16) +
+                (array[index + 2].toUInt() shl 8) + array[index + 3].toUInt()
+
+        fun read64(array: ByteArray, index: Int) : ULong =
+                (read32(array, index) shl 32).toULong() + read32(array, index + 4)
     }
 
-    constructor (value : Int)
+    constructor (first64Bits : ULong)
     {
-        this.value = value
-        this.extraData = null
-        this.extraDataOffset = 0
-        this.extraDataLength = 0
+        this.first64Bits = first64Bits
     }
 
-    constructor (type : Int, arg1 : Int, arg2 : Int, extraData : ByteArray?, extraOffset: Int, extraLength: Int)
+    constructor (first64Bits : ULong, second64Bits: ULong)
     {
-        this.value = type + (arg1 shl 8) + (arg2 shl 16)
-        this.extraData = extraData
-        this.extraDataOffset = extraOffset
-        this.extraDataLength = extraLength
+        this.first64Bits = first64Bits
     }
 
-    var value : Int = 0
+    var first64Bits : ULong = 0.toULong()
+    var second64Bits : ULong = 0.toULong()
 
-    // This expects EndSysEx byte _inclusive_ for F0 message.
-    val extraData : ByteArray?
-    val extraDataOffset : Int
-    val extraDataLength : Int
+    val typeAndGroupByte : Byte
+        get() = ((first64Bits and 0xF0000000u) shr 56) .toByte()
+
+    val messageType : Byte
+        get() = ((first64Bits and 0xF0000000u) shr 60) .toByte()
 
     val statusByte : Byte
-        get() = (value and 0xFF).toByte()
+        get() = ((first64Bits and 0xFF0000u) shr 32) .toByte()
 
     val eventType : Byte
         get() =
@@ -439,25 +443,26 @@ class MidiEvent // MIDI 1.0 only
                 MidiEventType.META,
                 MidiEventType.SYSEX,
                 MidiEventType.SYSEX_END -> this.statusByte
-                else ->(value and 0xF0).toByte()
+                else ->(statusByte.toInt() and 0xF0).toByte()
             }
 
-    val msb : Byte
-        get() = ((value and 0xFF00) shr 8).toByte()
-
-
-    val lsb : Byte
-        get() = ((value and 0xFF0000) shr 16).toByte()
-
-    val metaType : Byte
-        get() = msb
+    val group : Byte
+        get() = (typeAndGroupByte.toInt() and 0x0F).toByte()
 
     val channel : Byte
-        get() = (value and 0x0F).toByte()
+        get() = (statusByte.toInt() and 0x0F).toByte()
+
+    // utility property to simplify unique channel on a "device"
+    val groupAndChannel : Int
+        get() = group * 0x100 + channel
 
     override fun toString () : String
     {
-        return value.toString()
+        return when (getUmpSizeInBytes((messageType * 16).toByte())) {
+            16 -> String.format("[%16X:%16X]", first64Bits, second64Bits)
+            8 -> String.format("[%16X]", first64Bits)
+            else -> String.format("[%8X]", first64Bits)
+        }
     }
 }
 
@@ -1002,3 +1007,4 @@ class SmfTrackSplitter(var source: MutableList<MidiMessage>, deltaTimeSpec: Byte
         tracks[-1] = mtr
     }
 }
+
